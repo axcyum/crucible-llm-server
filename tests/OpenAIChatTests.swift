@@ -8,7 +8,7 @@ struct OpenAIChatTests {
             "tools": [["type": "function", "function": ["name": "Read", "parameters": ["type": "object"]]]]
         ]
         precondition(OpenAIChat.prompt(request).contains("Read a file"))
-        precondition(OpenAIChat.prompt(request).contains("function_name"))
+        precondition(OpenAIChat.prompt(request).contains("FUNCTION_CALL_JSON"))
         let gemma = OpenAIChat.prompt(request, gemma: true)
         precondition(gemma.hasPrefix("<bos><start_of_turn>user\n"))
         precondition(gemma.hasSuffix("<start_of_turn>model\n"))
@@ -29,6 +29,8 @@ struct OpenAIChatTests {
         precondition(OpenAIChat.objects(escaped).count == 1)
         precondition(OpenAIChat.message(escaped, request: request)["tool_calls"] != nil)
         precondition(!OpenAIChat.validArguments([:], function: ["parameters": ["required": ["file_path"]]]))
+        precondition(OpenAIChat.looksLikeToolCall(reported))
+        precondition(!OpenAIChat.looksLikeToolCall("The README describes an iPad server."))
         var disabled = request
         disabled["tool_choice"] = "none"
         precondition(OpenAIChat.message("{\"name\":\"Read\",\"arguments\":{}}", request: disabled)["tool_calls"] == nil)

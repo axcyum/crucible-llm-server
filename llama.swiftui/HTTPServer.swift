@@ -189,10 +189,20 @@ class HTTPServer {
                 return
             }
 
-            let result: String
+            var result: String
             do {
                 let prompt = OpenAIChat.prompt(json, gemma: await llamaState.usesGemma)
                 result = try await llamaState.completeForAPI(text: prompt, maxTokens: maxTokens)
+                if !OpenAIChat.functions(json).isEmpty,
+                   OpenAIChat.looksLikeToolCall(result), OpenAIChat.message(result, request: json)["tool_calls"] == nil {
+                    var repairRequest = json
+                    var repairMessages = messages
+                    repairMessages.append(["role": "assistant", "content": result])
+                    repairMessages.append(["role": "user", "content": "Your tool call was invalid. Emit exactly one tool call using an available function name and ALL its required argument keys exactly as listed in its schema. Do not use a generic parameter key. Do not claim that the tool has executed. Emit the corrected call now."])
+                    repairRequest["messages"] = repairMessages
+                    let repairPrompt = OpenAIChat.prompt(repairRequest, gemma: await llamaState.usesGemma)
+                    result = try await llamaState.completeForAPI(text: repairPrompt, maxTokens: maxTokens)
+                }
             } catch {
                 let status: String
                 let message: String
@@ -215,6 +225,12 @@ class HTTPServer {
                 return
             }
             let message = OpenAIChat.message(result, request: json)
+            if !OpenAIChat.functions(json).isEmpty,
+               OpenAIChat.looksLikeToolCall(result), message["tool_calls"] == nil {
+                self.sendResponse(connection: connection, status: "422 Unprocessable Entity",
+                                  body: OpenAIChat.json(["error": ["message": "The local model produced an invalid tool call even after one correction attempt. No tool was executed. Try a simpler request or a model with stronger tool calling.", "type": "invalid_model_tool_call"]]), contentType: "application/json")
+                return
+            }
             let id = "chatcmpl-\(UUID().uuidString)"
             let created = Int(Date().timeIntervalSince1970)
             if json["stream"] as? Bool == true {

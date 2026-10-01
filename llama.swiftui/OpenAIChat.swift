@@ -25,9 +25,24 @@ enum OpenAIChat {
         let functions = functions(request)
         var instruction = (gemma ? "" : "/no_think\n") + "You are a helpful coding assistant."
         if !functions.isEmpty {
+            let first = functions[0]
+            let schema = first["parameters"] as? [String: Any] ?? [:]
+            let properties = schema["properties"] as? [String: [String: Any]] ?? [:]
+            var example: [String: Any] = [:]
+            for key in schema["required"] as? [String] ?? [] {
+                switch properties[key]?["type"] as? String {
+                case "number", "integer": example[key] = 1
+                case "boolean": example[key] = true
+                case "array": example[key] = [String]()
+                case "object": example[key] = [String: String]()
+                default: example[key] = "value"
+                }
+            }
+            let sample = json(["name": first["name"] ?? "", "arguments": example])
             instruction += """
             \nYou may call these functions: \(json(functions))
-            To use a function, respond with ONLY <tool_call>{"name":"function_name","arguments":{"parameter":"value"}}</tool_call>.
+            To use a function, respond with ONLY <tool_call>FUNCTION_CALL_JSON</tool_call>.
+            A schema-correct example is <tool_call>\(sample)</tool_call>. Replace example values with actual values. Use that function's actual parameter keys exactly; never invent a key called parameter.
             Emit exactly ONE function call, then STOP. Use exact function names and valid JSON arguments matching the schema. Do not pretend to execute tools yourself. Tool results will follow in a tool message. After a successful read, answer using its actual contents; do not repeat the same read. If a filename is uncertain, use Glob to find the actual path first. Never edit a file when the user only asked to read it. Otherwise answer normally.
             """
             if request["tool_choice"] as? String == "required" { instruction += "\nYou must call a function." }
@@ -155,6 +170,15 @@ enum OpenAIChat {
         }
         if calls.isEmpty { return ["role": "assistant", "content": output] }
         return ["role": "assistant", "content": NSNull(), "tool_calls": calls]
+    }
+
+    static func looksLikeToolCall(_ output: String) -> Bool {
+        if output.contains("<tool_call>") { return true }
+        return objects(output).contains { candidate in
+            guard let data = candidate.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            return object["name"] is String && (object["arguments"] != nil || object["parameters"] != nil)
+        }
     }
 
     /// Buffered SSE: compatible with streaming clients; delivered after inference finishes.

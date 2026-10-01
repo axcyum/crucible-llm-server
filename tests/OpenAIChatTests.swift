@@ -21,6 +21,14 @@ struct OpenAIChatTests {
         precondition((function["arguments"] as? String)?.contains("file_path") == true)
         precondition(OpenAIChat.message("<tool_call>{\"name\":\"Unknown\",\"arguments\":{}}</tool_call>", request: request)["tool_calls"] == nil)
         precondition(OpenAIChat.message("<tool_call>broken</tool_call>", request: request)["tool_calls"] == nil)
+        let reported = "readmeを確認します。\n{\"name\":\"Read\",\"parameters\":{\"file_path\":\"readme\"}}\n確認しました。\n{\"name\":\"Read\",\"parameters\":{\"file_path\":\"readme\"}}"
+        let recovered = OpenAIChat.message(reported, request: request)["tool_calls"] as! [[String: Any]]
+        precondition(recovered.count == 1)
+        precondition((recovered[0]["function"] as! [String: Any])["name"] as? String == "Read")
+        let escaped = "before {\"name\":\"Read\",\"parameters\":{\"file_path\":\"C:\\\\test{one}.txt\"}} after"
+        precondition(OpenAIChat.objects(escaped).count == 1)
+        precondition(OpenAIChat.message(escaped, request: request)["tool_calls"] != nil)
+        precondition(!OpenAIChat.validArguments([:], function: ["parameters": ["required": ["file_path"]]]))
         var disabled = request
         disabled["tool_choice"] = "none"
         precondition(OpenAIChat.message("{\"name\":\"Read\",\"arguments\":{}}", request: disabled)["tool_calls"] == nil)

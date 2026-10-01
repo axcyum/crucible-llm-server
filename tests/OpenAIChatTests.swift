@@ -31,6 +31,11 @@ struct OpenAIChatTests {
         precondition(!OpenAIChat.validArguments([:], function: ["parameters": ["required": ["file_path"]]]))
         precondition(OpenAIChat.looksLikeToolCall(reported))
         precondition(!OpenAIChat.looksLikeToolCall("The README describes an iPad server."))
+        var withResult = request
+        withResult["messages"] = [["role": "user", "content": "Read the file"], ["role": "tool", "tool_call_id": "test", "content": "REAL_CONTENT_9361"]]
+        let resultPrompt = OpenAIChat.prompt(withResult, gemma: true)
+        precondition(resultPrompt.contains("<tool_result>\nREAL_CONTENT_9361\n</tool_result>"))
+        precondition(resultPrompt.contains("Never invent different file contents"))
         var disabled = request
         disabled["tool_choice"] = "none"
         precondition(OpenAIChat.message("{\"name\":\"Read\",\"arguments\":{}}", request: disabled)["tool_calls"] == nil)

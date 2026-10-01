@@ -121,7 +121,7 @@ actor LlamaContext {
         print("attempting to complete \"\(text)\"")
 
         is_done = false
-        tokens_list = tokenize(text: text, add_bos: true)
+        tokens_list = tokenize(text: text, add_bos: !text.hasPrefix("<bos>"))
         temporary_invalid_cchars = []
 
         let n_ctx = llama_n_ctx(context)

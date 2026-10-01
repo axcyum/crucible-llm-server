@@ -21,6 +21,8 @@ class LlamaState: ObservableObject {
     let httpServer = HTTPServer(port: 8080)
 
     private var llamaContext: LlamaContext?
+    private var generating = false
+    private(set) var usesGemma = false
     private var defaultModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-model", withExtension: "gguf", subdirectory: "models")
         // Bundle.main.url(forResource: "llama-2-7b-chat", withExtension: "Q2_K.gguf", subdirectory: "models")
@@ -115,9 +117,11 @@ class LlamaState: ObservableObject {
         )
     ]
     func loadModel(modelUrl: URL?) throws {
+        guard !generating else { throw APIInferenceError.busy }
         if let modelUrl {
             messageLog += "Loading model...\n"
             llamaContext = try LlamaContext.create_context(path: modelUrl.path())
+            usesGemma = modelUrl.lastPathComponent.lowercased().contains("gemma")
             messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
 
             // Assuming that the model is successfully loaded, update the downloaded models
@@ -134,12 +138,20 @@ class LlamaState: ObservableObject {
 
 
     func complete(text: String) async {
+        guard !generating else { return }
         guard let llamaContext else {
             return
         }
 
         let t_start = DispatchTime.now().uptimeNanoseconds
-        await llamaContext.completion_init(text: text)
+        generating = true
+        do {
+            try await llamaContext.completion_init(text: text)
+        } catch {
+            generating = false
+            messageLog += "Prompt exceeds the model context or inference failed.\n"
+            return
+        }
         let t_heat_end = DispatchTime.now().uptimeNanoseconds
         let t_heat = Double(t_heat_end - t_start) / NS_PER_S
 
@@ -166,11 +178,15 @@ class LlamaState: ObservableObject {
                     Heat up took \(t_heat)s
                     Generated \(tokens_per_second) t/s\n
                     """
+                self.generating = false
             }
         }
     }
 
     func bench() async {
+        guard !generating else { return }
+        generating = true
+        defer { generating = false }
         guard let llamaContext else {
             return
         }
@@ -200,6 +216,7 @@ class LlamaState: ObservableObject {
     }
 
     func clear() async {
+        guard !generating else { return }
         guard let llamaContext else {
             return
         }
@@ -230,12 +247,19 @@ class LlamaState: ObservableObject {
     }
 
     // Non-streaming completion for API use
-    func completeForAPI(text: String, maxTokens: Int = 500) async -> String {
+    func completeForAPI(text: String, maxTokens: Int = 500) async throws -> String {
+        guard !generating else { throw APIInferenceError.busy }
         guard let llamaContext else {
-            return "Error: No model loaded"
+            throw APIInferenceError.noModel
         }
-
-        await llamaContext.completion_init(text: text)
+        generating = true
+        defer { generating = false }
+        do {
+            try await llamaContext.completion_init(text: text, maxTokens: maxTokens)
+        } catch {
+            await llamaContext.clear()
+            throw error
+        }
         var result = ""
         var tokenCount = 0
 
@@ -266,4 +290,9 @@ class LlamaState: ObservableObject {
 
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+}
+
+enum APIInferenceError: Error {
+    case busy
+    case noModel
 }

@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,12 +24,13 @@ jobs:
           sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -showsdks | grep -i ios
 
-      - name: Build llama.cpp xcframework
+      - name: Test OpenAI adapter
         run: |
-          cd llama.cpp
-          chmod +x build-xcframework.sh
-          ./build-xcframework.sh
-          ls -la build-apple/llama.xcframework/
+          swiftc llama.swiftui/OpenAIChat.swift tests/OpenAIChatTests.swift -o /tmp/chat-adapter-tests
+          /tmp/chat-adapter-tests
+
+      - name: Build llama.cpp iOS xcframework
+        run: python3 scripts/build-ios-framework.py
 
       - name: Build iOS app
         run: |
@@ -45,7 +47,8 @@ jobs:
 
       - name: Package IPA
         run: |
-          APP_PATH=$(find build -name "*.app" -type d | head -1)
+          APP_PATH="build/Build/Products/Release-iphoneos/CrucibleLLM.app"
+          test -d "$APP_PATH"
           echo "Found app at: $APP_PATH"
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
@@ -56,3 +59,4 @@ jobs:
         with:
           name: CrucibleLLM
           path: CrucibleLLM.ipa
+          if-no-files-found: error

@@ -3,6 +3,8 @@ import llama
 
 enum LlamaError: Error {
     case couldNotInitializeContext
+    case contextOverflow
+    case decodeFailed
 }
 
 func llama_batch_clear(_ batch: inout llama_batch) {
@@ -77,7 +79,8 @@ actor LlamaContext {
         print("Using \(n_threads) threads")
 
         var ctx_params = llama_context_default_params()
-        ctx_params.n_ctx = 1024  // reduced from 2048 to lower KV cache memory on iPad
+        ctx_params.n_ctx = 8192
+        ctx_params.n_batch = 512
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
 
@@ -114,7 +117,7 @@ actor LlamaContext {
         return batch.n_tokens;
     }
 
-    func completion_init(text: String) {
+    func completion_init(text: String, maxTokens: Int = 512) throws {
         print("attempting to complete \"\(text)\"")
 
         is_done = false
@@ -122,31 +125,29 @@ actor LlamaContext {
         temporary_invalid_cchars = []
 
         let n_ctx = llama_n_ctx(context)
-        let n_kv_req = tokens_list.count + (Int(n_len) - tokens_list.count)
+        let n_kv_req = tokens_list.count + 1
 
         print("\n n_len = \(n_len), n_ctx = \(n_ctx), n_kv_req = \(n_kv_req)")
 
-        if n_kv_req > n_ctx {
-            print("error: n_kv_req > n_ctx, the required KV cache size is not big enough")
+        guard !tokens_list.isEmpty, n_kv_req <= Int(n_ctx) else {
+            is_done = true
+            throw LlamaError.contextOverflow
         }
-
-        for id in tokens_list {
-            print(String(cString: token_to_piece(token: id) + [0]))
+        n_len = Int32(min(Int(n_ctx), tokens_list.count + max(1, min(maxTokens, 2048))))
+        llama_memory_clear(llama_get_memory(context), true)
+        llama_sampler_reset(sampling)
+        for start in stride(from: 0, to: tokens_list.count, by: 512) {
+            llama_batch_clear(&batch)
+            let end = min(start + 512, tokens_list.count)
+            for i in start..<end {
+                llama_batch_add(&batch, tokens_list[i], Int32(i), [0], i == tokens_list.count - 1)
+            }
+            guard llama_decode(context, batch) == 0 else {
+                is_done = true
+                throw LlamaError.decodeFailed
+            }
         }
-
-        llama_batch_clear(&batch)
-
-        for i1 in 0..<tokens_list.count {
-            let i = Int(i1)
-            llama_batch_add(&batch, tokens_list[i], Int32(i), [0], false)
-        }
-        batch.logits[Int(batch.n_tokens) - 1] = 1 // true
-
-        if llama_decode(context, batch) != 0 {
-            print("llama_decode() failed")
-        }
-
-        n_cur = batch.n_tokens
+        n_cur = Int32(tokens_list.count)
     }
 
     func completion_loop() -> String {
@@ -154,7 +155,7 @@ actor LlamaContext {
 
         new_token_id = llama_sampler_sample(sampling, context, batch.n_tokens - 1)
 
-        if llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len {
+        if llama_vocab_is_eog(vocab, new_token_id) || n_cur >= n_len {
             print("\n")
             is_done = true
             let new_token_str = String(cString: temporary_invalid_cchars + [0])
@@ -187,6 +188,7 @@ actor LlamaContext {
 
         if llama_decode(context, batch) != 0 {
             print("failed to evaluate llama!")
+            is_done = true
         }
 
         return new_token_str
@@ -300,10 +302,10 @@ actor LlamaContext {
         let utf8Count = text.utf8.count
         let n_tokens = utf8Count + (add_bos ? 1 : 0) + 1
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: n_tokens)
-        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, false)
+        let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, true)
 
         var swiftTokens: [llama_token] = []
-        for i in 0..<tokenCount {
+        for i in 0..<max(0, tokenCount) {
             swiftTokens.append(tokens[Int(i)])
         }
 

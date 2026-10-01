@@ -57,12 +57,50 @@ class HTTPServer {
 
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
+        receiveRequest(connection, buffered: Data())
+    }
+
+    private func receiveRequest(_ connection: NWConnection, buffered: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
             guard let self = self, let data = data, error == nil else {
                 connection.cancel()
                 return
             }
-            let request = String(data: data, encoding: .utf8) ?? ""
+            var bytes = buffered
+            bytes.append(data)
+            guard bytes.count <= 4 * 1024 * 1024 else {
+                self.sendResponse(connection: connection, status: "413 Payload Too Large", body: "{\"error\":\"Request exceeds 4 MiB\"}")
+                return
+            }
+            guard let separator = bytes.range(of: Data("\r\n\r\n".utf8)) else {
+                self.receiveRequest(connection, buffered: bytes)
+                return
+            }
+            let header = String(data: bytes[..<separator.lowerBound], encoding: .utf8) ?? ""
+            var contentLength = 0
+            for line in header.components(separatedBy: "\r\n").dropFirst() {
+                let parts = line.split(separator: ":", maxSplits: 1)
+                if parts.count == 2 && parts[0].lowercased() == "transfer-encoding" {
+                    self.sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Use Content-Length; chunked requests are unsupported\"}")
+                    return
+                }
+                if parts.count == 2 && parts[0].lowercased() == "content-length" {
+                    guard let length = Int(parts[1].trimmingCharacters(in: .whitespaces)), length >= 0, length <= 4 * 1024 * 1024 else {
+                        self.sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Invalid Content-Length\"}")
+                        return
+                    }
+                    contentLength = length
+                }
+            }
+            let end = separator.upperBound + contentLength
+            if bytes.count < end {
+                self.receiveRequest(connection, buffered: bytes)
+                return
+            }
+            guard let request = String(data: bytes[..<end], encoding: .utf8) else {
+                self.sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Invalid UTF-8\"}")
+                return
+            }
             self.routeRequest(request, connection: connection)
         }
     }
@@ -131,21 +169,17 @@ class HTTPServer {
             return
         }
 
-        // Build prompt using ChatML format (works with Qwen, Gemma, most chat models)
-        // Inject /no_think by default unless the caller explicitly includes a system message
-        var prompt = ""
-        let hasSystemMessage = messages.contains { ($0["role"] as? String) == "system" }
-        if !hasSystemMessage {
-            prompt += "<|im_start|>system\n/no_think\nBe concise and helpful.<|im_end|>\n"
+        guard !messages.isEmpty else {
+            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"messages must not be empty\"}")
+            return
         }
-        for msg in messages {
-            let role = msg["role"] as? String ?? "user"
-            let content = msg["content"] as? String ?? ""
-            prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
+        for message in messages {
+            if let blocks = message["content"] as? [[String: Any]], blocks.contains(where: { ($0["type"] as? String) != "text" }) {
+                sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Only text content is supported\"}")
+                return
+            }
         }
-        prompt += "<|im_start|>assistant\n"
-
-        let maxTokens = json["max_tokens"] as? Int ?? 500
+        let maxTokens = max(1, min(json["max_completion_tokens"] as? Int ?? json["max_tokens"] as? Int ?? 512, 2048))
 
         // Run inference on a background thread
         Task {
@@ -155,20 +189,50 @@ class HTTPServer {
                 return
             }
 
-            let result = await llamaState.completeForAPI(text: prompt, maxTokens: maxTokens)
+            let result: String
+            do {
+                let prompt = OpenAIChat.prompt(json, gemma: await llamaState.usesGemma)
+                result = try await llamaState.completeForAPI(text: prompt, maxTokens: maxTokens)
+            } catch {
+                let status: String
+                let message: String
+                switch error {
+                case LlamaError.contextOverflow:
+                    status = "400 Bad Request"
+                    message = "Prompt exceeds the 8192-token context. Shorten history or reduce tools."
+                case APIInferenceError.busy:
+                    status = "503 Service Unavailable"
+                    message = "Model is busy. Send one request at a time."
+                case APIInferenceError.noModel:
+                    status = "503 Service Unavailable"
+                    message = "Load a model in the iPad app first."
+                default:
+                    status = "500 Internal Server Error"
+                    message = "Inference failed."
+                }
+                self.sendResponse(connection: connection, status: status,
+                                  body: OpenAIChat.json(["error": ["message": message, "type": "invalid_request_error"]]), contentType: "application/json")
+                return
+            }
+            let message = OpenAIChat.message(result, request: json)
+            let id = "chatcmpl-\(UUID().uuidString)"
+            let created = Int(Date().timeIntervalSince1970)
+            if json["stream"] as? Bool == true {
+                self.sendResponse(connection: connection, status: "200 OK",
+                                  body: OpenAIChat.stream(message: message, id: id, created: created, model: "local"),
+                                  contentType: "text/event-stream", extraHeaders: ["Cache-Control: no-cache"])
+                return
+            }
 
             let responseJSON: [String: Any] = [
-                "id": "chatcmpl-\(UUID().uuidString.prefix(8))",
+                "id": id,
                 "object": "chat.completion",
-                "created": Int(Date().timeIntervalSince1970),
+                "created": created,
                 "model": "local",
                 "choices": [[
                     "index": 0,
-                    "message": [
-                        "role": "assistant",
-                        "content": result
-                    ],
-                    "finish_reason": "stop"
+                    "message": message,
+                    "finish_reason": message["tool_calls"] == nil ? "stop" : "tool_calls"
                 ]]
             ]
 
